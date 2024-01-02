@@ -81,6 +81,16 @@ public class ConversationService {
 
         CharacterInfo characterInfo = characterInfoRepository.findByName(characterName);
 
+        if (conversationCharacterRepository.existsById(userId)) {
+            conversationCharacterRepository.updateByUserId(userId, characterName);
+        } else {
+            conversationCharacterRepository.save(new ConversationCharacter(userId, characterName));
+        }
+
+        CompletableFuture.runAsync(() -> {
+            getSentence(characterName, "<start>");
+        });
+
         ByteString audioContent = TextToSpeech(hello, characterInfo.getVoiceName(), characterInfo.getPitch(), characterInfo.getLangCode());
 
         CompletableFuture<ConversationResponse> conversationResponse =  CompletableFuture.supplyAsync(() -> {
@@ -94,18 +104,6 @@ public class ConversationService {
                 }
             } catch (IOException e) {
                 throw new RuntimeException(e);
-            }
-        });
-
-        CompletableFuture.runAsync(() -> {
-            getSentence(characterName, "<start>");
-
-            if (conversationCharacterRepository.existsById(userId)) {
-                conversationsRepository.save(new Conversations(new ConversationsId(conversationId, userId, hello)));
-                conversationCharacterRepository.updateByUserId(userId, characterName);
-            } else {
-                conversationsRepository.save(new Conversations(new ConversationsId(conversationId, userId, hello)));
-                conversationCharacterRepository.save(new ConversationCharacter(userId, characterName));
             }
         });
 
@@ -131,30 +129,36 @@ public class ConversationService {
         String sentence = SpeechToText(audioFile); // 사용자 음성 파일 텍스트로 변환
         AtomicReference<String> url = new AtomicReference<>();
 
-        CompletableFuture.runAsync(() -> {
+//        CompletableFuture<String> pronunciation = CompletableFuture.supplyAsync(() -> {
+//            try {
+//                pronunciationAssessment(userId, conversationId, sentence, audioFile);
+//            } catch (ExecutionException | InterruptedException | TimeoutException | IOException e) {
+//                throw new RuntimeException(e);
+//            }
+//            return sentence;
+//        });
+
+        CompletableFuture<String> mlSentence = CompletableFuture.supplyAsync(() -> {
             try {
-                pronunciationAssessment(userId, conversationId, sentence, audioFile);
-            } catch (ExecutionException | InterruptedException | TimeoutException | IOException e) {
+                String ml = getSentence(character, sentence).get();
+                ByteString speech = TextToSpeech(ml, characterInfo.getVoiceName(), characterInfo.getPitch(), characterInfo.getLangCode());
+                if (speech != null) {
+                    url.set(storageService.uploadModelAudioAndSend(userId, speech));
+                    return ml;
+                } else {
+                    return null;
+                }
+            } catch (IOException | ExecutionException | InterruptedException e) {
                 throw new RuntimeException(e);
             }
         });
 
-        CompletableFuture<String> mlSentence = getSentence(character, sentence).thenApply(result -> {
-            try {
-                ByteString speech = TextToSpeech(result, characterInfo.getVoiceName(), characterInfo.getPitch(), characterInfo.getLangCode());
-                if (speech != null) {
-                    url.set(storageService.uploadModelAudioAndSend(userId, speech));
-                    return result;
-                } else {
-                    return null;
-                }
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }).orTimeout(1, TimeUnit.MILLISECONDS);
+//        CompletableFuture<Void> future = CompletableFuture.allOf(pronunciation, mlSentence);
+//
+//        future.get();
 
         if (mlSentence.get() != null) {
-
+            conversationsRepository.save(new Conversations(new ConversationsId(conversationId, userId, sentence)));
             conversationsRepository.save(new Conversations(new ConversationsId(conversationId, userId, mlSentence.get())));
             return new ConversationResponse(true, "사용자 음성 저장 및 음성 생성 완료", url.get());
         } else {
@@ -310,27 +314,31 @@ public class ConversationService {
         ObjectMapper objectMapper = new ObjectMapper();
         JsonNode rootNode = objectMapper.readTree(pronunciationAssessmentResultJson);
         String displayText = rootNode.path("DisplayText").asText();
-        JsonNode pronunciation = rootNode.path("NBest").get(0).path("PronunciationAssessment");
-        double accuracy = pronunciation.path("AccuracyScore").asDouble();
-        double prosody = pronunciation.path("ProsodyScore").asDouble();
-        double fluency = pronunciation.path("FluencyScore").asDouble();
-        double completeness = pronunciation.path("CompletenessScore").asDouble();
-        double pron = pronunciation.path("PronScore").asDouble();
 
         conversationsRepository.save(new Conversations(new ConversationsId(conversationId, userId, displayText)));
 
-        EstimationScores estimationScores = new EstimationScores(
-                userId, conversationId, displayText, accuracy, prosody, pron, fluency, completeness);
+        JsonNode pronunciation = rootNode.path("NBest").get(0);
+        if (!pronunciation.isEmpty()){
+            JsonNode nBest = pronunciation.path("PronunciationAssessment");
+            double accuracy = nBest.path("AccuracyScore").asDouble();
+            double prosody = pronunciation.path("ProsodyScore").asDouble();
+            double fluency = pronunciation.path("FluencyScore").asDouble();
+            double completeness = pronunciation.path("CompletenessScore").asDouble();
+            double pron = pronunciation.path("PronScore").asDouble();
 
-        estimationScoreRepository.save(estimationScores);
-        JsonNode wordsNode = rootNode.path("NBest").get(0).path("Words");
-        for (JsonNode wordNode : wordsNode) {
-            JsonNode pronunciationAssessment = wordNode.path("PronunciationAssessment");
-            String errorWord = pronunciationAssessment.path("Word").asText();
-            String errorType = pronunciationAssessment.path("ErrorType").asText();
-            if (errorType == "None") {
-                ErrorWords errorWords = new ErrorWords(userId, displayText, errorWord, errorType);
-                errorWordRepository.save(errorWords);
+            estimationScoreRepository.save(new EstimationScores(
+                    userId, conversationId, displayText, accuracy, prosody, pron, fluency, completeness));
+            JsonNode wordsNode = nBest.path("Words");
+            if (!wordsNode.isEmpty()){
+                for (JsonNode wordNode : wordsNode) {
+                    JsonNode pronunciationAssessment = wordNode.path("PronunciationAssessment");
+                    String errorWord = pronunciationAssessment.path("Word").asText();
+                    String errorType = pronunciationAssessment.path("ErrorType").asText();
+                    if (errorType == "None") {
+                        ErrorWords errorWords = new ErrorWords(userId, displayText, errorWord, errorType);
+                        errorWordRepository.save(errorWords);
+                    }
+                }
             }
         }
 
